@@ -32,6 +32,10 @@ inputs:
       description: "Liste des vérifications Checkov à ignorer, séparées par des virgules. Par exemple: 'BC_CROSS_1,BC_CROSS_2,BC_AWS_GENERAL_192,CKV_AWS_149'"
       required: false
       default: "BC_CROSS_1,BC_CROSS_2,BC_AWS_GENERAL_192,CKV_AWS_149"  # Example of checks to ignore
+    checkov_ca_bundle:
+      description: "Chemin facultatif vers un bundle CA présent sur le runner. Si vide, les chemins Linux standards sont détectés automatiquement."
+      required: false
+      default: ""
 outputs:
     terraform_validate:
         description: "Terraform validate output"
@@ -82,13 +86,140 @@ runs:
           run: terraform validate
           shell: bash
 
+        - name: Prepare trusted CA bundle for Checkov
+          id: checkov-ca
+          env:
+            CONFIGURED_CA_BUNDLE: ${{ inputs.checkov_ca_bundle }}
+          run: |
+            set -euo pipefail
+
+            system_candidates=(
+              /etc/ssl/certs/ca-certificates.crt
+              /etc/pki/tls/certs/ca-bundle.crt
+              /etc/ssl/cert.pem
+              /var/lib/ca-certificates/ca-bundle.pem
+            )
+            extra_candidates=(
+              "$CONFIGURED_CA_BUNDLE"
+              "${NODE_EXTRA_CA_CERTS:-}"
+              "${SSL_CERT_FILE:-}"
+              "${REQUESTS_CA_BUNDLE:-}"
+              "${CURL_CA_BUNDLE:-}"
+              "$(git config --global --get http.sslCAInfo 2>/dev/null || true)"
+            )
+            destination="$RUNNER_TEMP/checkov-ca-bundle.crt"
+            bundle_created=false
+
+            for candidate in "${system_candidates[@]}"; do
+              if [[ -r "$candidate" ]]; then
+                cp "$candidate" "$destination"
+                bundle_created=true
+                echo "Bundle CA système détecté: $candidate"
+                break
+              fi
+            done
+
+            for candidate in "${extra_candidates[@]}"; do
+              if [[ -n "$candidate" && -r "$candidate" ]]; then
+                if [[ "$bundle_created" == true ]]; then
+                  printf '\n' >> "$destination"
+                  cat "$candidate" >> "$destination"
+                else
+                  cp "$candidate" "$destination"
+                  bundle_created=true
+                fi
+                echo "Certificats CA supplémentaires détectés: $candidate"
+              fi
+            done
+
+            if [[ "$bundle_created" == true ]]; then
+              echo "container_path=/github/runner_temp/checkov-ca-bundle.crt" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "::warning::Aucun bundle CA compatible trouvé; Checkov utilisera son magasin de certificats par défaut."
+            echo "container_path=" >> "$GITHUB_OUTPUT"
+          shell: bash
+
+        - name: Normalize Prisma policy IDs for offline Checkov use
+          id: checkov-policy-ids
+          env:
+            RAW_SKIP_CHECKS: ${{ inputs.checkov_ignore_list }}
+          run: |
+            set -euo pipefail
+
+            normalize_bc_id() {
+              case "$1" in
+                BC_AWS_GENERAL_121) echo CKV_AWS_226 ;;
+                BC_AWS_GENERAL_192) echo CKV2_AWS_57 ;;
+                BC_AWS_GENERAL_225) echo CKV_AWS_313 ;;
+                BC_AWS_GENERAL_244) echo CKV_AWS_341 ;;
+                BC_AWS_GENERAL_31) echo CKV_AWS_79 ;;
+                BC_AWS_GENERAL_49) echo CKV2_AWS_8 ;;
+                BC_AWS_GENERAL_79) echo CKV_AWS_149 ;;
+                BC_AWS_GENERAL_96) echo CKV2_AWS_27 ;;
+                BC_AWS_IAM_56) echo CKV_AWS_109 ;;
+                BC_AWS_IAM_57) echo CKV_AWS_111 ;;
+                BC_AWS_IAM_66) echo CKV_AWS_162 ;;
+                BC_AWS_IAM_89) echo CKV_AWS_356 ;;
+                BC_AWS_KUBERNETES_1) echo CKV_AWS_38 ;;
+                BC_AWS_KUBERNETES_2) echo CKV_AWS_39 ;;
+                BC_AWS_KUBERNETES_3) echo CKV_AWS_58 ;;
+                BC_AWS_KUBERNETES_4) echo CKV_AWS_37 ;;
+                BC_AWS_LOGGING_25) echo CKV_AWS_124 ;;
+                BC_AWS_LOGGING_46) echo CKV_AWS_338 ;;
+                BC_AWS_NETWORKING_51) echo CKV2_AWS_5 ;;
+                BC_CROSS_1) echo CKV_TF_1 ;;
+                BC_CROSS_2) echo CKV_TF_2 ;;
+                *) return 1 ;;
+              esac
+            }
+
+            IFS=',' read -ra requested_checks <<< "$RAW_SKIP_CHECKS"
+            normalized_checks=()
+            has_unknown_bc_id=false
+
+            for check in "${requested_checks[@]}"; do
+              check="${check//[[:space:]]/}"
+              [[ -z "$check" ]] && continue
+
+              if normalized_check="$(normalize_bc_id "$check")"; then
+                echo "Normalisation Checkov: $check -> $normalized_check"
+                normalized_checks+=("$normalized_check")
+              else
+                normalized_checks+=("$check")
+                [[ "$check" == BC_* ]] && has_unknown_bc_id=true
+              fi
+            done
+
+            normalized_csv="$(IFS=,; echo "${normalized_checks[*]}")"
+            echo "skip_checks=$normalized_csv" >> "$GITHUB_OUTPUT"
+
+            if [[ "$has_unknown_bc_id" == true ]]; then
+              echo "::warning::Un identifiant BC_* sans correspondance locale a été fourni; Checkov tentera de télécharger le mapping Prisma."
+              echo "skip_download=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "skip_download=true" >> "$GITHUB_OUTPUT"
+            fi
+          shell: bash
+
         - name: Checkov scan
           # This step uses the Checkov GitHub Action to scan Terraform code for security issues.
           id: checkov
-          uses: bridgecrewio/checkov-action@master        
+          uses: bridgecrewio/checkov-action@master
+          env:
+            # Docker actions mount RUNNER_TEMP at /github/runner_temp.
+            # Reuse the runner trust store so corporate proxy CAs remain trusted.
+            REQUESTS_CA_BUNDLE: ${{ steps.checkov-ca.outputs.container_path }}
           with:
             framework: terraform
             directory: ${{ inputs.working_directory }}
-            skip_check: ${{ inputs.checkov_ignore_list }}
+            skip_check: ${{ steps.checkov-policy-ids.outputs.skip_checks }}
+            skip_download: ${{ steps.checkov-policy-ids.outputs.skip_download }}
             output_format: json
             download_external_modules: true
+
+        - name: Remove temporary Checkov CA bundle
+          if: always()
+          run: rm -f "$RUNNER_TEMP/checkov-ca-bundle.crt"
+          shell: bash
