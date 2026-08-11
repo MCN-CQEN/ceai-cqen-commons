@@ -53,7 +53,7 @@ runs:
             ENVIRONMENT_NAME="main"
             ;;
 
-          release/v1)
+          release/v1|release-v1)
             RUNNER_ENV="release-v1"
             ENVIRONMENT_NAME="release-v1"
             ;;
