@@ -1,7 +1,8 @@
 name: "Clone repository configuration"
-description: "Clone un repository GitHub et copie ses variables et environnements"
+description: "Clone un repository GitHub et copie ses variables et environnements (fork if possible)"
 
 inputs:
+
   source_repo:
     description: "Repository source, ex: org/source-repo"
     required: true
@@ -18,7 +19,7 @@ runs:
   using: composite
 
   steps:
-    - name: Clone source repository
+    - name: Fork source repository (if possible)
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -27,27 +28,63 @@ runs:
       run: |
         set -euo pipefail
 
-        rm -rf source-repo
-
-        git clone \
-          "https://x-access-token:${GH_TOKEN}@github.com/${SOURCE_REPO}.git" \
-          source-repo
-
-    - name: Create target repository
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.github_token }}
-        TARGET_REPO: ${{ inputs.target_repo }}
-      run: |
-        set -euo pipefail
+        TARGET_OWNER="${TARGET_REPO%%/*}"
+        TARGET_NAME="${TARGET_REPO##*/}"
+        SOURCE_OWNER="${SOURCE_REPO%%/*}"
+        SOURCE_NAME="${SOURCE_REPO##*/}"
 
         if gh repo view "${TARGET_REPO}" >/dev/null 2>&1; then
-          echo "Repository ${TARGET_REPO} already exists"
+          echo "Repository ${TARGET_REPO} already exists; skipping fork."
         else
-          gh repo create "${TARGET_REPO}" --private
+          echo "Attempting to fork ${SOURCE_REPO} into ${TARGET_OWNER}..."
+
+          # Try to fork into the target owner (organization). If target owner is the authenticated user,
+          # POST without organization is acceptable — but passing organization will attempt org fork.
+          gh api --method POST "/repos/${SOURCE_REPO}/forks" -f organization="${TARGET_OWNER}" || true
+
+          # Wait for the fork to appear (fork creation is asynchronous)
+          for i in $(seq 1 30); do
+            if gh repo view "${TARGET_REPO}" >/dev/null 2>&1; then
+              echo "Fork available: ${TARGET_REPO}"
+              break
+            fi
+            sleep 2
+          done
+
+          if ! gh repo view "${TARGET_REPO}" >/dev/null 2>&1; then
+            echo "Fork did not appear. Will fall back to cloning/pushing the source repository."
+            exit 1
+          fi
         fi
 
-    - name: Push repository content
+    - name: Clone repository (prefer the forked target, fallback to source)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        SOURCE_REPO: ${{ inputs.source_repo }}
+        TARGET_REPO: ${{ inputs.target_repo }}
+      run: |
+        set -euo pipefail
+
+        rm -rf workspace-repo
+        mkdir -p workspace-repo
+        cd workspace-repo
+
+        if gh repo view "${TARGET_REPO}" >/dev/null 2>&1; then
+          echo "Cloning target repository ${TARGET_REPO} (fork or preexisting)"
+          git clone \
+            "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" \
+            target-repo
+          echo "CLONED_TARGET=1" > .clone_info
+        else
+          echo "Target repository not available; cloning source ${SOURCE_REPO} as fallback"
+          git clone \
+            "https://x-access-token:${GH_TOKEN}@github.com/${SOURCE_REPO}.git" \
+            source-repo
+          echo "CLONED_TARGET=0" > .clone_info
+        fi
+
+    - name: Create target repository (only if we need to create it and did not fork)
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -55,9 +92,52 @@ runs:
       run: |
         set -euo pipefail
 
-        cd source-repo
+        # If the target already exists, nothing to do.
+        if gh repo view "${TARGET_REPO}" >/dev/null 2>&1; then
+          echo "Repository ${TARGET_REPO} already exists"
+          exit 0
+        fi
 
-        git remote remove origin
+        # Otherwise create a private repository with the target full name's owner
+        TARGET_OWNER="${TARGET_REPO%%/*}"
+        TARGET_NAME="${TARGET_REPO##*/}"
+
+        echo "Creating repository ${TARGET_REPO} under ${TARGET_OWNER}"
+        # gh repo create supports 'org/name' target via --public/--private and specifying the full name
+        # Use API as a fallback to ensure creation under an org
+        gh api --method POST "/user/repos" -f name="${TARGET_NAME}" -f private=true >/dev/null 2>&1 || true
+
+        # If creation under org is required and local POST failed, attempt org create
+        if ! gh repo view "${TARGET_REPO}" >/dev/null 2>&1; then
+          gh api --method POST "/orgs/${TARGET_OWNER}/repos" -f name="${TARGET_NAME}" -f private=true
+        fi
+
+    - name: Push repository content (only when we cloned the source fallback)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        SOURCE_REPO: ${{ inputs.source_repo }}
+        TARGET_REPO: ${{ inputs.target_repo }}
+      run: |
+        set -euo pipefail
+
+        cd workspace-repo
+
+        CLONED_TARGET=$(cat .clone_info)
+        if [[ "${CLONED_TARGET}" == "CLONED_TARGET=1" ]]; then
+          echo "We cloned the target repo (fork or preexisting). No push required."
+          exit 0
+        fi
+
+        # We cloned the source repo (fallback) and need to push it to the target
+        if [[ -d "source-repo" ]]; then
+          cd source-repo
+        else
+          echo "source-repo not found; nothing to push"
+          exit 1
+        fi
+
+        git remote remove origin || true
 
         git remote add origin \
           "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git"
