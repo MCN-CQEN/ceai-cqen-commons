@@ -30,7 +30,6 @@ runs:
 
         TARGET_OWNER="${TARGET_REPO%%/*}"
         TARGET_NAME="${TARGET_REPO##*/}"
-        SOURCE_OWNER="${SOURCE_REPO%%/*}"
 
         echo "Attempting to fork ${SOURCE_REPO} into ${TARGET_REPO}..."
 
