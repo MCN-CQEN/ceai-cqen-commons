@@ -1,0 +1,194 @@
+name: "Fork repository"
+description: "Fork un repo GitHub au target owner/name et copie ses variables et environnements"
+
+inputs:
+
+  source_repo:
+    description: "Repository source, ex: org/source-repo"
+    required: true
+
+  target_repo:
+    description: "Repository cible, ex: org/target-repo"
+    required: true
+
+  github_token:
+    description: "Token GitHub avec permissions suffisantes"
+    required: true
+
+runs:
+  using: composite
+
+  steps:
+    - name: Fork source repository
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        SOURCE_REPO: ${{ inputs.source_repo }}
+        TARGET_REPO: ${{ inputs.target_repo }}
+      run: |
+        set -euo pipefail
+
+        TARGET_OWNER="${TARGET_REPO%%/*}"
+        TARGET_NAME="${TARGET_REPO##*/}"
+
+        echo "Attempting to fork ${SOURCE_REPO} into ${TARGET_REPO}..."
+
+        # Fork to the target owner
+        gh api --method POST "/repos/${SOURCE_REPO}/forks" -f organization="${TARGET_OWNER}" -f name="${TARGET_NAME}"
+
+        # Wait for the fork to appear (fork creation is asynchronous)
+        for i in $(seq 1 30); do
+          if gh repo view "${TARGET_REPO}" >/dev/null 2>&1; then
+            echo "Fork available: ${TARGET_REPO}"
+            exit 0
+          fi
+          sleep 2
+        done
+
+        # If fork did not appear, fail
+        echo "ERROR: Fork did not appear after 60 seconds"
+        exit 1
+
+    # Variables
+
+    - name: Copy repository variables
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        SOURCE_REPO: ${{ inputs.source_repo }}
+        TARGET_REPO: ${{ inputs.target_repo }}
+      run: |
+        set -euo pipefail
+
+        gh api \
+          "/repos/${SOURCE_REPO}/actions/variables" \
+          --paginate \
+          --jq '.variables[] | [.name,.value] | @tsv' |
+        while IFS=$'\t' read -r NAME VALUE; do
+
+          echo "Copy repository variable: ${NAME}"
+
+          gh variable set "${NAME}" \
+            --repo "${TARGET_REPO}" \
+            --body "${VALUE}"
+
+        done
+
+    - name: Copy environments and environment variables
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        SOURCE_REPO: ${{ inputs.source_repo }}
+        TARGET_REPO: ${{ inputs.target_repo }}
+      run: |
+        set -euo pipefail
+
+        ENVIRONMENTS=$(
+          gh api \
+            "/repos/${SOURCE_REPO}/environments" \
+            --paginate \
+            --jq '.environments[].name'
+        )
+
+        while IFS= read -r ENV_NAME; do
+          [[ -z "${ENV_NAME}" ]] && continue
+
+          echo "Create environment: ${ENV_NAME}"
+
+          ENCODED_ENV="$(
+            printf '%s' "${ENV_NAME}" |
+            jq -sRr @uri
+          )"
+
+          gh api \
+            --method PUT \
+            "/repos/${TARGET_REPO}/environments/${ENCODED_ENV}"
+
+          echo "Copy variables from ${ENV_NAME}"
+
+          gh api \
+            "/repos/${SOURCE_REPO}/environments/${ENCODED_ENV}/variables" \
+            --paginate \
+            --jq '.variables[] | [.name,.value] | @tsv' |
+          while IFS=$'\t' read -r NAME VALUE; do
+
+            echo "Copy environment variable: ${ENV_NAME}/${NAME}"
+
+            gh variable set "${NAME}" \
+              --repo "${TARGET_REPO}" \
+              --env "${ENV_NAME}" \
+              --body "${VALUE}"
+
+          done
+
+        done <<< "${ENVIRONMENTS}"
+
+
+    # Secrets
+
+    - name: Copy repository secret names with values to be configured
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        SOURCE_REPO: ${{ inputs.source_repo }}
+        TARGET_REPO: ${{ inputs.target_repo }}
+      run: |
+        set -euo pipefail
+
+        echo "Copy repository secret names from ${SOURCE_REPO}"
+
+        gh api \
+          "/repos/${SOURCE_REPO}/actions/secrets" \
+          --paginate \
+          --jq '.secrets[].name' |
+        while IFS= read -r SECRET_NAME; do
+          [[ -z "${SECRET_NAME}" ]] && continue
+
+          echo "Create empty repository secret: ${SECRET_NAME}"
+
+          gh secret set "${SECRET_NAME}" \
+            --repo "${TARGET_REPO}" \
+            --body "TO_BE_CONFIGURED"
+        done
+
+    - name: Copy environment secret names with values to be configured
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        SOURCE_REPO: ${{ inputs.source_repo }}
+        TARGET_REPO: ${{ inputs.target_repo }}
+      run: |
+        set -euo pipefail
+
+        ENVIRONMENTS=$(
+          gh api \
+            "/repos/${SOURCE_REPO}/environments" \
+            --paginate \
+            --jq '.environments[].name'
+        )
+
+        while IFS= read -r ENV_NAME; do
+          [[ -z "${ENV_NAME}" ]] && continue
+
+          echo "Environment: ${ENV_NAME}"
+
+          ENCODED_ENV="$(
+            printf '%s' "${ENV_NAME}" |
+            jq -sRr @uri
+          )"
+
+          gh api \
+            "/repos/${SOURCE_REPO}/environments/${ENCODED_ENV}/secrets" \
+            --paginate \
+            --jq '.secrets[].name' |
+          while IFS= read -r SECRET_NAME; do
+            [[ -z "${SECRET_NAME}" ]] && continue
+
+            echo "Create empty environment secret: ${ENV_NAME}/${SECRET_NAME}"
+
+            gh secret set "${SECRET_NAME}" \
+              --repo "${TARGET_REPO}" \
+              --env "${ENV_NAME}" \
+              --body "TO_BE_CONFIGURED"
+          done
+        done <<< "${ENVIRONMENTS}"
